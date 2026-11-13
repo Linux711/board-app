@@ -134,18 +134,38 @@
   async function createBoard() {
     await ensureAnonymousSession();
     const localState = boardApi().getState();
-    const document = await documentForCloud(localState);
     const activeProject = localState.projects.find((project) => project.id === localState.active)
       || localState.projects[0];
+
+    // Create the board and its membership first. Storage upload policies require
+    // that membership before they allow image files to be inserted.
+    const initialDocument = structuredClone(localState);
+    for (const project of initialDocument.projects || []) {
+      for (const card of project.cards || []) {
+        if (card.image?.startsWith('data:image/')) card.image = '';
+        delete card.imagePath;
+      }
+    }
+
     const { data, error } = await client.rpc('create_shared_board', {
       board_name: activeProject?.name || 'Shared board',
-      initial_document: document
+      initial_document: initialDocument
     });
     if (error) throw error;
 
     boardId = data[0].board_id;
     inviteToken = data[0].invite_token;
     rememberConnection();
+    lastSavedDocument = JSON.stringify(initialDocument);
+
+    // Now upload the original image data and replace it with private Storage paths.
+    const document = await documentForCloud(localState);
+    const { error: updateError } = await client
+      .from('boards')
+      .update({ name: activeProject?.name || 'Shared board', document })
+      .eq('id', boardId);
+    if (updateError) throw updateError;
+
     lastSavedDocument = JSON.stringify(document);
     subscribeToBoard();
   }
@@ -202,7 +222,11 @@
 
   async function handleShare() {
     try {
-      if (!boardId) await createBoard();
+      if (!boardId) {
+        await createBoard();
+      } else {
+        await syncLatestState(boardApi().getState());
+      }
 
       const shareUrl = new URL(location.href);
       shareUrl.search = '';
